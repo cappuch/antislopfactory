@@ -44,6 +44,24 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
   display:flex;align-items:center;gap:12px;background:var(--surface);font-size:12px}
 .topbar .thread-id{color:var(--text2);font-size:11px}
 .topbar .model-name{color:var(--accent)}
+
+/* cumulative risk display */
+.risk-display{display:none;align-items:center;gap:8px;font-size:11px;
+  padding:2px 8px;border-radius:4px;background:var(--surface2);cursor:pointer;position:relative}
+.risk-display.active{display:flex}
+.risk-display .risk-num{font-weight:700;font-size:13px}
+.risk-display .risk-num.low{color:var(--green)}
+.risk-display .risk-num.mid{color:var(--yellow)}
+.risk-display .risk-num.high{color:var(--red)}
+.risk-detail{color:var(--text2)}
+.risk-tooltip{display:none;position:absolute;top:100%;right:0;margin-top:4px;
+  background:var(--surface);border:1px solid var(--border);border-radius:6px;
+  padding:10px 14px;width:320px;z-index:10;font-size:11px;line-height:1.6;
+  box-shadow:0 4px 12px rgba(0,0,0,.4)}
+.risk-display:hover .risk-tooltip{display:block}
+.risk-tooltip code{background:var(--surface2);padding:1px 4px;border-radius:2px;
+  font-size:10px}
+.risk-tooltip .formula{color:var(--accent);font-family:inherit}
 .stream-stats{margin-left:auto;display:none;align-items:center;gap:10px;font-size:11px;color:var(--text2)}
 .stream-stats.active{display:flex}
 .stream-stats .live-dot{width:6px;height:6px;border-radius:50%;background:var(--red);
@@ -150,10 +168,13 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
 .modal .btn-create{background:var(--accent);color:#000;border:none;
   padding:6px 14px;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600}
 
-/* tool status */
+/* tool / grounding status */
 .tool-status{padding:4px 16px;background:#1a1e2a;border-top:1px solid #2d4a7a;
   font-size:11px;color:var(--accent);display:none;align-items:center;gap:6px}
 .tool-status.active{display:flex}
+.grounding-status{padding:4px 16px;background:#1a1a2e;border-top:1px solid #3a2d7a;
+  font-size:11px;color:#a78bfa;display:none;align-items:center;gap:6px}
+.grounding-status.active{display:flex}
 .spinner{width:12px;height:12px;border:2px solid var(--accent);
   border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -183,6 +204,21 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
     <div class="topbar">
       <span class="model-name" id="modelName">antislopfactory</span>
       <span class="thread-id" id="threadIdDisplay">no thread selected</span>
+      <div class="risk-display" id="riskDisplay">
+        <span>thread risk:</span>
+        <span class="risk-num" id="riskNum">0</span>
+        <span class="risk-detail" id="riskDetail"></span>
+        <div class="risk-tooltip">
+          <div><b>Cumulative Thread Risk</b></div>
+          <div class="formula">R(t) = R(t-1) + &alpha; &middot; (r - R(t-1))</div>
+          <div style="margin-top:4px">
+            &alpha; = <code>0.60</code> when r &ge; R (fast rise)<br>
+            &alpha; = <code>0.12</code> when r &lt; R (slow decay)<br>
+            floor = <code>peak &times; 0.25</code> (can never fully wash risk)
+          </div>
+          <div style="margin-top:6px" id="riskTooltipValues"></div>
+        </div>
+      </div>
       <div class="stream-stats" id="streamStats">
         <div class="live-dot"></div>
         <div class="stat">ttft: <span class="stat-val" id="statTtft">--</span></div>
@@ -194,6 +230,11 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
 
     <div class="messages" id="messages">
       <div class="empty-state">create or select a thread to start</div>
+    </div>
+
+    <div class="grounding-status" id="groundingStatus">
+      <div class="spinner"></div>
+      <span>grounding: searching the web...</span>
     </div>
 
     <div class="tool-status" id="toolStatus">
@@ -291,10 +332,15 @@ async function loadThreads() {
   for (const t of data.threads) {
     const div = document.createElement('div');
     div.className = 'thread-item' + (t.thread_id === currentThreadId ? ' active' : '');
-    const riskClass = t.risk >= 7 ? 'danger' : t.risk >= 4 ? 'warn' : '';
+    const rs = t.risk_score ?? 0;
+    const riskClass = rs >= 6 ? 'danger' : rs >= 3 ? 'warn' : '';
     div.innerHTML = `
       <span class="thread-preview">${t.first_user_message || 'empty thread'}</span>
-      <span class="risk-badge ${riskClass}">${t.risk}</span>`;
+      <span class="risk-badge ${riskClass}">${rs.toFixed(1)}</span>`;
+    // update topbar risk if this is the active thread
+    if (t.thread_id === currentThreadId) {
+      updateRiskDisplay(t.risk, t.risk_score, t.peak_risk);
+    }
     div.onclick = () => selectThread(t.thread_id);
     list.appendChild(div);
   }
@@ -330,10 +376,24 @@ async function selectThread(threadId) {
   await loadMessages();
 }
 
+function updateRiskDisplay(risk, riskScore, peakRisk) {
+  const el = document.getElementById('riskDisplay');
+  const numEl = document.getElementById('riskNum');
+  const detailEl = document.getElementById('riskDetail');
+  const valuesEl = document.getElementById('riskTooltipValues');
+  el.classList.add('active');
+  numEl.textContent = (riskScore ?? 0).toFixed(2);
+  numEl.className = 'risk-num ' + (riskScore >= 6 ? 'high' : riskScore >= 3 ? 'mid' : 'low');
+  const floor = ((peakRisk ?? 0) * 0.25).toFixed(2);
+  detailEl.textContent = `peak: ${(peakRisk ?? 0).toFixed(1)} | floor: ${floor}`;
+  valuesEl.innerHTML = `R(t) = <b>${(riskScore ?? 0).toFixed(3)}</b><br>peak = <b>${(peakRisk ?? 0).toFixed(3)}</b><br>floor = <b>${floor}</b>`;
+}
+
 async function loadMessages() {
   if (!currentThreadId) return;
   const r = await fetch(`${API}/threads/${currentThreadId}/messages`);
   const data = await r.json();
+  updateRiskDisplay(data.risk, data.risk_score, data.peak_risk);
   const container = document.getElementById('messages');
   container.innerHTML = '';
   for (const m of data.messages) {
@@ -613,6 +673,10 @@ async function streamChat(message) {
   isStreaming = true;
   document.getElementById('sendBtn').disabled = true;
 
+  // show grounding indicator (only for new user messages, not tool continuations)
+  const groundingEl = document.getElementById('groundingStatus');
+  if (message !== null) groundingEl.classList.add('active');
+
   // show live stats
   const statsEl = document.getElementById('streamStats');
   const statTtft = document.getElementById('statTtft');
@@ -646,6 +710,9 @@ async function streamChat(message) {
     headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
     body: JSON.stringify(body)
   });
+
+  // stream started — grounding is done
+  groundingEl.classList.remove('active');
 
   const messagesEl = document.getElementById('messages');
   let contentWrap = null;   // msg-wrap div

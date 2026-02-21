@@ -20,6 +20,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS threads (
     thread_id  TEXT PRIMARY KEY,
     risk       INTEGER NOT NULL DEFAULT 0,
+    risk_score REAL NOT NULL DEFAULT 0.0,
+    peak_risk  REAL NOT NULL DEFAULT 0.0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -69,6 +71,14 @@ class ThreadStore:
 
     def _init_tables(self) -> None:
         self._conn().executescript(_SCHEMA)
+        # migrate: add columns if missing (existing DBs)
+        conn = self._conn()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
+        if "risk_score" not in cols:
+            conn.execute("ALTER TABLE threads ADD COLUMN risk_score REAL NOT NULL DEFAULT 0.0")
+        if "peak_risk" not in cols:
+            conn.execute("ALTER TABLE threads ADD COLUMN peak_risk REAL NOT NULL DEFAULT 0.0")
+        conn.commit()
 
     def _close_all(self) -> None:
         with self._lock:
@@ -99,15 +109,18 @@ class ThreadStore:
 
     def _get_thread(self, thread_id: str) -> dict | None:
         row = self._conn().execute(
-            "SELECT thread_id, risk, created_at, updated_at FROM threads WHERE thread_id = ?",
+            "SELECT thread_id, risk, risk_score, peak_risk, created_at, updated_at "
+            "FROM threads WHERE thread_id = ?",
             (thread_id,),
         ).fetchone()
         return dict(row) if row else None
 
-    def _update_risk(self, thread_id: str, risk: int) -> None:
+    def _update_risk(self, thread_id: str, risk: int,
+                     risk_score: float = 0.0, peak_risk: float = 0.0) -> None:
         self._conn().execute(
-            "UPDATE threads SET risk = ?, updated_at = ? WHERE thread_id = ?",
-            (risk, time.time(), thread_id),
+            "UPDATE threads SET risk = ?, risk_score = ?, peak_risk = ?, updated_at = ? "
+            "WHERE thread_id = ?",
+            (risk, risk_score, peak_risk, time.time(), thread_id),
         )
         self._conn().commit()
 
@@ -117,8 +130,9 @@ class ThreadStore:
     async def get_thread(self, thread_id: str) -> dict | None:
         return await asyncio.to_thread(self._get_thread, thread_id)
 
-    async def update_risk(self, thread_id: str, risk: int) -> None:
-        await asyncio.to_thread(self._update_risk, thread_id, risk)
+    async def update_risk(self, thread_id: str, risk: int,
+                          risk_score: float = 0.0, peak_risk: float = 0.0) -> None:
+        await asyncio.to_thread(self._update_risk, thread_id, risk, risk_score, peak_risk)
 
     def _append_message(
         self,
@@ -212,7 +226,8 @@ class ThreadStore:
 
     def _list_threads(self) -> list[dict]:
         rows = self._conn().execute(
-            "SELECT t.thread_id, t.risk, t.created_at, t.updated_at, "
+            "SELECT t.thread_id, t.risk, t.risk_score, t.peak_risk, "
+            "  t.created_at, t.updated_at, "
             "  m.content AS first_user_message "
             "FROM threads t "
             "LEFT JOIN messages m ON m.thread_id = t.thread_id "

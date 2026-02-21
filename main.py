@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from db import ThreadStore, genid
 from util.classifier import MLPClassifier
 from util.embed import embed
+from util.grounding import ground
 
 load_dotenv()
 
@@ -112,6 +113,8 @@ class ToolResultsRequest(BaseModel):
 class ThreadSummary(BaseModel):
     thread_id: str
     risk: int
+    risk_score: float
+    peak_risk: float
     first_user_message: str | None
     created_at: float
     updated_at: float
@@ -135,6 +138,8 @@ class MessageDetail(BaseModel):
 class ThreadMessagesResponse(BaseModel):
     thread_id: str
     risk: int
+    risk_score: float
+    peak_risk: float
     created_at: float
     updated_at: float
     messages: list[MessageDetail]
@@ -142,10 +147,55 @@ class ThreadMessagesResponse(BaseModel):
 
 # ── helpers ───────────────────────────────────────────────────────────
 
-def _compute_risk(probs: dict[str, float]) -> int:
-    """Map classification probabilities to a 0-10 integer risk score."""
+def _msg_risk(probs: dict[str, float]) -> float:
+    """Raw per-message risk from classification probabilities (0.0-10.0)."""
     unsafe_sum = sum(probs.get(l, 0.0) for l in UNSAFE_LABELS)
-    return min(10, int(unsafe_sum * 10))
+    return min(10.0, unsafe_sum * 10.0)
+
+
+# ── cumulative thread risk formula ───────────────────────────────────
+#
+#   Asymmetric EMA with peak-floor ratchet.
+#
+#   For each classified message with raw risk r:
+#
+#     alpha = ALPHA_UP   if r >= R(t-1)    (fast rise)
+#             ALPHA_DOWN if r <  R(t-1)    (slow decay)
+#
+#     R(t) = R(t-1) + alpha * (r - R(t-1))
+#
+#     peak  = max(peak, r)
+#     floor = peak * FLOOR_RATIO
+#     R(t)  = max(R(t), floor)              (can never fully wash risk)
+#
+#   ALPHA_UP    = 0.6   →  risky content is weighted 60%
+#   ALPHA_DOWN  = 0.12  →  safe content barely nudges score down
+#   FLOOR_RATIO = 0.25  →  score can never drop below 25% of peak
+#
+ALPHA_UP = 0.6
+ALPHA_DOWN = 0.12
+FLOOR_RATIO = 0.25
+
+
+def _update_cumulative_risk(
+    current_score: float, peak: float, msg_risk_val: float,
+) -> tuple[int, float, float]:
+    """Compute new cumulative thread risk.
+
+    Returns (display_risk_int, risk_score_float, peak_float).
+    """
+    if msg_risk_val >= current_score:
+        alpha = ALPHA_UP
+    else:
+        alpha = ALPHA_DOWN
+
+    new_score = current_score + alpha * (msg_risk_val - current_score)
+    new_peak = max(peak, msg_risk_val)
+    floor = new_peak * FLOOR_RATIO
+    new_score = max(new_score, floor)
+    new_score = max(0.0, min(10.0, new_score))
+
+    return round(new_score), new_score, new_peak
 
 
 CHUNK_SIZE = 500  # chars per embedding chunk
@@ -190,7 +240,7 @@ def _make_classification_event(result: dict, content_length: int, final: bool) -
         "label": result["label"],
         "probabilities": result["probabilities"],
         "content_length": content_length,
-        "risk": _compute_risk(result["probabilities"]),
+        "risk": round(_msg_risk(result["probabilities"])),
         "final": final,
     }
     return f"event: classification\ndata: {json.dumps(payload)}\n\n".encode()
@@ -282,6 +332,8 @@ async def list_threads():
             ThreadSummary(
                 thread_id=t["thread_id"],
                 risk=t["risk"],
+                risk_score=t.get("risk_score", 0.0),
+                peak_risk=t.get("peak_risk", 0.0),
                 first_user_message=t["first_user_message"],
                 created_at=t["created_at"],
                 updated_at=t["updated_at"],
@@ -316,6 +368,8 @@ async def get_thread_messages(thread_id: str):
     return ThreadMessagesResponse(
         thread_id=thread["thread_id"],
         risk=thread["risk"],
+        risk_score=thread.get("risk_score", 0.0),
+        peak_risk=thread.get("peak_risk", 0.0),
         created_at=thread["created_at"],
         updated_at=thread["updated_at"],
         messages=messages,
@@ -345,6 +399,11 @@ async def submit_tool_results(thread_id: str, req: ToolResultsRequest):
             thread_id, "tool", tr.content,
             metadata=meta,
         )
+        if tool_clf:
+            mr = _msg_risk(tool_clf["probabilities"])
+            t = await store.get_thread(thread_id)
+            ri, rf, pf = _update_cumulative_risk(t["risk_score"], t["peak_risk"], mr)
+            await store.update_risk(thread_id, ri, rf, pf)
     return {"ok": True}
 
 
@@ -360,9 +419,28 @@ async def chat_message(thread_id: str, req: ChatRequest):
         user_clf = await _classify_text(req.message)
         user_meta = {"classification": user_clf} if user_clf else None
         await store.append_message(thread_id, "user", req.message, metadata=user_meta)
+        # update cumulative thread risk from user message
+        if user_clf:
+            mr = _msg_risk(user_clf["probabilities"])
+            t = await store.get_thread(thread_id)
+            ri, rf, pf = _update_cumulative_risk(t["risk_score"], t["peak_risk"], mr)
+            await store.update_risk(thread_id, ri, rf, pf)
 
     # build full conversation for upstream
     messages = await _build_upstream_messages(thread_id)
+
+    # search grounding: inject web results into the last user message
+    if req.message is not None:
+        # build context from recent messages for better query generation
+        recent = [m["content"] for m in messages[-4:] if m.get("content")]
+        context = "\n".join(recent[-3:]) if len(recent) > 1 else ""
+        grounding_block = await ground(req.message, context)
+        if grounding_block:
+            # append grounding to the last user message (sent to LLM, not stored)
+            for m in reversed(messages):
+                if m["role"] == "user":
+                    m["content"] = m["content"] + "\n\n" + grounding_block
+                    break
 
     payload: dict[str, Any] = {
         "model": ALLOWED_MODEL,
@@ -398,7 +476,6 @@ async def chat_message(thread_id: str, req: ChatRequest):
 
         # classify content
         classification = await _classify_text(content) if content else None
-        risk = _compute_risk(classification["probabilities"]) if classification else 0
 
         # persist assistant message
         meta: dict[str, Any] = {}
@@ -421,15 +498,19 @@ async def chat_message(thread_id: str, req: ChatRequest):
             metadata=meta or None,
             embedding=emb_array,
         )
-        if risk > 0:
-            await store.update_risk(thread_id, risk)
+        if classification:
+            mr = _msg_risk(classification["probabilities"])
+            t = await store.get_thread(thread_id)
+            risk_int, risk_f, peak_f = _update_cumulative_risk(
+                t["risk_score"], t["peak_risk"], mr)
+            await store.update_risk(thread_id, risk_int, risk_f, peak_f)
 
         # attach classification to response
         if classification:
             data["classification"] = {
                 "label": classification["label"],
                 "probabilities": classification["probabilities"],
-                "risk": risk,
+                "risk": round(_msg_risk(classification["probabilities"])),
             }
 
         return JSONResponse(content=data)
@@ -500,7 +581,6 @@ async def chat_message(thread_id: str, req: ChatRequest):
                         if content_buffer:
                             result = await _classify_text(content_buffer)
                             if result:
-                                risk = _compute_risk(result["probabilities"])
                                 yield _make_classification_event(
                                     result, len(content_buffer), final=True,
                                 )
@@ -517,7 +597,11 @@ async def chat_message(thread_id: str, req: ChatRequest):
                                     metadata=meta or None,
                                     embedding=emb_array,
                                 )
-                                await store.update_risk(thread_id, risk)
+                                mr = _msg_risk(result["probabilities"])
+                                t = await store.get_thread(thread_id)
+                                ri, rf, pf = _update_cumulative_risk(
+                                    t["risk_score"], t["peak_risk"], mr)
+                                await store.update_risk(thread_id, ri, rf, pf)
                             else:
                                 await store.append_message(
                                     thread_id, "assistant", content_buffer,
