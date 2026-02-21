@@ -1,0 +1,1 @@
+plz use uv for now `curl -LsSf https://astral.sh/uv/install.sh | sh`
