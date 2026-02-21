@@ -148,12 +148,18 @@ def _compute_risk(probs: dict[str, float]) -> int:
     return min(10, int(unsafe_sum * 10))
 
 
+CHUNK_SIZE = 500  # chars per embedding chunk
+
+
 async def _classify_text(text: str) -> dict[str, Any] | None:
-    """Embed text and run safety classifier. Returns None if unavailable."""
+    """Embed text in 500-char chunks, average the vectors, then classify."""
     if clf is None or not text.strip():
         return None
     try:
-        vecs = await embed(text)
+        chunks = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+        all_vecs = await embed(chunks)
+        avg_vec = np.mean(np.array(all_vecs, dtype=np.float64), axis=0)
+        vecs = [avg_vec.tolist()]
         label = clf.predict(vecs)[0]
         probs = clf.predict_proba(vecs)[0]
         return {"label": label, "probabilities": probs}
@@ -331,9 +337,13 @@ async def submit_tool_results(thread_id: str, req: ToolResultsRequest):
     if thread is None:
         raise HTTPException(404, "thread not found")
     for tr in req.tool_results:
+        tool_clf = await _classify_text(tr.content)
+        meta: dict[str, Any] = {"tool_call_id": tr.tool_call_id}
+        if tool_clf:
+            meta["classification"] = tool_clf
         await store.append_message(
             thread_id, "tool", tr.content,
-            metadata={"tool_call_id": tr.tool_call_id},
+            metadata=meta,
         )
     return {"ok": True}
 
@@ -347,7 +357,9 @@ async def chat_message(thread_id: str, req: ChatRequest):
 
     # persist user message (skip when continuing after tool results)
     if req.message is not None:
-        await store.append_message(thread_id, "user", req.message)
+        user_clf = await _classify_text(req.message)
+        user_meta = {"classification": user_clf} if user_clf else None
+        await store.append_message(thread_id, "user", req.message, metadata=user_meta)
 
     # build full conversation for upstream
     messages = await _build_upstream_messages(thread_id)
