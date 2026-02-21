@@ -100,6 +100,21 @@ paths:
           description: Model not loaded
 
   /threads:
+    get:
+      operationId: listThreads
+      tags: [threads]
+      summary: List all conversation threads
+      description: |
+        Returns all threads ordered by most recently updated, each with
+        the thread ID, risk score, timestamps, and the content of the
+        first user message (for preview in a thread list UI).
+      responses:
+        "200":
+          description: Thread list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListThreadsResponse"
     post:
       operationId: makeThread
       tags: [threads]
@@ -120,6 +135,30 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MakeThreadResponse"
+
+  /threads/{thread_id}/messages:
+    get:
+      operationId: getThreadMessages
+      tags: [threads]
+      summary: Get all messages in a thread
+      description: |
+        Returns the full thread metadata and every message including
+        content, reasoning, classification metadata, and embedding vectors.
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread with all messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThreadMessagesResponse"
+        "404":
+          description: Thread not found
 
   /threads/{thread_id}/chat:
     post:
@@ -307,6 +346,97 @@ components:
             type: object
         classification:
           $ref: "#/components/schemas/ClassificationEvent"
+
+    ThreadSummary:
+      type: object
+      required: [thread_id, risk, created_at, updated_at]
+      properties:
+        thread_id:
+          type: string
+          example: "0193a1b2c3d-4e5f6a"
+        risk:
+          type: integer
+          minimum: 0
+          maximum: 10
+        first_user_message:
+          type: string
+          nullable: true
+          description: Content of the first user message in the thread, or null if none.
+          example: "What is the capital of France?"
+        created_at:
+          type: number
+          format: double
+          description: Unix timestamp.
+        updated_at:
+          type: number
+          format: double
+          description: Unix timestamp.
+
+    ListThreadsResponse:
+      type: object
+      required: [threads]
+      properties:
+        threads:
+          type: array
+          items:
+            $ref: "#/components/schemas/ThreadSummary"
+
+    MessageDetail:
+      type: object
+      required: [id, seq, role, content, reasoning_content, created_at]
+      properties:
+        id:
+          type: integer
+          description: Database row ID.
+        seq:
+          type: integer
+          description: Message sequence number within the thread.
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+        reasoning_content:
+          type: string
+          description: Model reasoning/thinking content, empty string if none.
+        metadata:
+          type: object
+          nullable: true
+          description: |
+            Arbitrary metadata. For assistant messages this typically contains
+            `classification` (label + probabilities) and/or `tool_calls`.
+        embedding:
+          type: array
+          nullable: true
+          description: Float32 embedding vector, or null if not computed.
+          items:
+            type: number
+            format: float
+        created_at:
+          type: number
+          format: double
+          description: Unix timestamp.
+
+    ThreadMessagesResponse:
+      type: object
+      required: [thread_id, risk, created_at, updated_at, messages]
+      properties:
+        thread_id:
+          type: string
+        risk:
+          type: integer
+          minimum: 0
+          maximum: 10
+        created_at:
+          type: number
+          format: double
+        updated_at:
+          type: number
+          format: double
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageDetail"
 
     ModelList:
       type: object

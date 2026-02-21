@@ -92,6 +92,37 @@ class ChatRequest(BaseModel):
     stream: bool = True
 
 
+class ThreadSummary(BaseModel):
+    thread_id: str
+    risk: int
+    first_user_message: str | None
+    created_at: float
+    updated_at: float
+
+
+class ListThreadsResponse(BaseModel):
+    threads: list[ThreadSummary]
+
+
+class MessageDetail(BaseModel):
+    id: int
+    seq: int
+    role: str
+    content: str
+    reasoning_content: str
+    metadata: dict[str, Any] | None = None
+    embedding: list[float] | None = None
+    created_at: float
+
+
+class ThreadMessagesResponse(BaseModel):
+    thread_id: str
+    risk: int
+    created_at: float
+    updated_at: float
+    messages: list[MessageDetail]
+
+
 # ── helpers ───────────────────────────────────────────────────────────
 
 def _compute_risk(probs: dict[str, float]) -> int:
@@ -218,6 +249,55 @@ async def classify(req: ClassifyRequest):
 
 
 # ── thread management ────────────────────────────────────────────────
+
+@app.get("/threads", response_model=ListThreadsResponse)
+async def list_threads():
+    """List all threads with their ID, risk, and first user message."""
+    threads = await store.list_threads()
+    return ListThreadsResponse(
+        threads=[
+            ThreadSummary(
+                thread_id=t["thread_id"],
+                risk=t["risk"],
+                first_user_message=t["first_user_message"],
+                created_at=t["created_at"],
+                updated_at=t["updated_at"],
+            )
+            for t in threads
+        ]
+    )
+
+
+@app.get("/threads/{thread_id}/messages", response_model=ThreadMessagesResponse)
+async def get_thread_messages(thread_id: str):
+    """Return all messages in a thread including embeddings and classifications."""
+    thread = await store.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(404, "thread not found")
+
+    db_messages = await store.get_messages(thread_id)
+    messages = [
+        MessageDetail(
+            id=m["id"],
+            seq=m["seq"],
+            role=m["role"],
+            content=m["content"],
+            reasoning_content=m["reasoning_content"],
+            metadata=m.get("metadata"),
+            embedding=m["embedding"].tolist() if m.get("embedding") is not None else None,
+            created_at=m["created_at"],
+        )
+        for m in db_messages
+    ]
+
+    return ThreadMessagesResponse(
+        thread_id=thread["thread_id"],
+        risk=thread["risk"],
+        created_at=thread["created_at"],
+        updated_at=thread["updated_at"],
+        messages=messages,
+    )
+
 
 @app.post("/threads", response_model=MakeThreadResponse)
 async def make_thread(req: MakeThreadRequest):

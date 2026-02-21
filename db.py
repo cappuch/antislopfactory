@@ -209,3 +209,21 @@ class ThreadStore:
         self, thread_id: str, limit: int | None = None, offset: int = 0
     ) -> list[dict]:
         return await asyncio.to_thread(self._get_messages, thread_id, limit, offset)
+
+    def _list_threads(self) -> list[dict]:
+        rows = self._conn().execute(
+            "SELECT t.thread_id, t.risk, t.created_at, t.updated_at, "
+            "  m.content AS first_user_message "
+            "FROM threads t "
+            "LEFT JOIN messages m ON m.thread_id = t.thread_id "
+            "  AND m.role = 'user' "
+            "  AND m.seq = ("
+            "    SELECT MIN(seq) FROM messages "
+            "    WHERE thread_id = t.thread_id AND role = 'user'"
+            "  ) "
+            "ORDER BY t.updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_threads(self) -> list[dict]:
+        return await asyncio.to_thread(self._list_threads)
