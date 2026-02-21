@@ -1,0 +1,1 @@
+{"messages": [{"role": "user/tool/assistant", "reasoning_content": "content", "content": "content", "metadata": [], "embedding": []}], "thread_id": "thread_id", "risk": "int"}

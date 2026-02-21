@@ -1,0 +1,329 @@
+openapi: 3.1.0
+info:
+  title: antislopfactory
+  description: |
+    Real-time safety classification proxy for LLM inference.
+
+    Proxies chat completions to an upstream OpenAI-compatible API while running
+    a trained MLP safety classifier on streamed content tokens in real time.
+    Classification results (label + per-class probabilities + risk score) are
+    injected into the SSE stream as `event: classification` frames.
+
+    ## Flow
+
+    1. **Create a thread** — `POST /threads` with a system prompt.
+    2. **Chat** — `POST /threads/{thread_id}/chat` with a user message (and
+       optional tool definitions).  The response streams back with interleaved
+       `classification` SSE events.
+    3. All messages, embeddings, and risk scores are persisted in SQLite.
+
+    ## Classification
+
+    The safety classifier outputs one of 16 labels:
+    `criminal`, `deception`, `fraud`, `harassment`, `harmful`, `hate`,
+    `illegal`, `malware`, `privacy`, `professional_advice`, `safe`,
+    `self_harm`, `sexual`, `unethical`, `unsafe_other`, `violence`.
+
+    Risk is an integer 0-10 derived from the sum of unsafe-category
+    probabilities.
+  version: 0.2.0
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev
+
+tags:
+  - name: threads
+    description: Conversation thread management and inference
+  - name: classify
+    description: Standalone text safety classification
+  - name: meta
+    description: Health and model listing
+
+paths:
+  /health:
+    get:
+      operationId: health
+      tags: [meta]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  model_loaded:
+                    type: boolean
+                required: [status, model_loaded]
+
+  /v1/models:
+    get:
+      operationId: listModels
+      tags: [meta]
+      summary: List available models
+      description: Returns the single enforced proxy model.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+
+  /classify:
+    post:
+      operationId: classify
+      tags: [classify]
+      summary: Classify text safety
+      description: |
+        Embed one or more texts via ds-1 and run the MLP safety classifier.
+        Returns a label and full probability distribution for each input.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClassifyRequest"
+      responses:
+        "200":
+          description: Classification results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClassifyResponse"
+        "503":
+          description: Model not loaded
+
+  /threads:
+    post:
+      operationId: makeThread
+      tags: [threads]
+      summary: Create a conversation thread
+      description: |
+        Creates a new thread and stores the system prompt as the first message.
+        Returns the thread ID to use in subsequent `/chat` calls.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MakeThreadRequest"
+      responses:
+        "200":
+          description: Thread created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MakeThreadResponse"
+
+  /threads/{thread_id}/chat:
+    post:
+      operationId: chatMessage
+      tags: [threads]
+      summary: Send a message and get a classified response
+      description: |
+        Appends the user message to the thread, proxies the full conversation
+        to the upstream LLM, and returns the completion.
+
+        ### Streaming (default)
+
+        Returns `text/event-stream` with two event types:
+
+        1. **Unnamed events** — standard OpenAI `chat.completion.chunk` objects,
+           forwarded verbatim from upstream.
+        2. **`classification` events** — safety classification of the content
+           accumulated so far.  Emitted every ~500 chars and once at the end
+           (`"final": true`) right before `data: [DONE]`.
+
+        ```text
+        data: {"id":"...","choices":[{"delta":{"content":"Hi"}}]}
+
+        event: classification
+        data: {"label":"safe","probabilities":{...},"content_length":512,"risk":0,"final":false}
+
+        data: {"id":"...","choices":[{"delta":{"content":"!"}}]}
+
+        event: classification
+        data: {"label":"safe","probabilities":{...},"content_length":1024,"risk":0,"final":true}
+
+        data: [DONE]
+        ```
+
+        ### Non-streaming
+
+        Returns a standard OpenAI chat completion JSON with an additional
+        top-level `classification` field.
+
+        After the response completes the assistant message, embedding, and
+        risk score are persisted to the thread in the database.
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: |
+            If `stream: true` — `text/event-stream` with chat chunks and
+            classification events.
+            If `stream: false` — JSON chat completion with classification.
+          content:
+            text/event-stream:
+              schema:
+                description: SSE stream (see description above)
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionWithClassification"
+        "404":
+          description: Thread not found
+
+components:
+  schemas:
+    ClassifyRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          description: One or more texts to classify.
+          example: "How do I pick a lock?"
+
+    ClassifyResult:
+      type: object
+      required: [text, label, probabilities]
+      properties:
+        text:
+          type: string
+        label:
+          type: string
+          example: safe
+        probabilities:
+          type: object
+          additionalProperties:
+            type: number
+          example:
+            safe: 0.94
+            violence: 0.01
+            harassment: 0.005
+
+    ClassifyResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClassifyResult"
+
+    MakeThreadRequest:
+      type: object
+      required: [system_prompt]
+      properties:
+        system_prompt:
+          type: string
+          description: System prompt stored as the first message in the thread.
+          example: You are a helpful assistant.
+
+    MakeThreadResponse:
+      type: object
+      required: [thread_id]
+      properties:
+        thread_id:
+          type: string
+          example: "0193a1b2c3d-4e5f6a"
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: The user message content.
+          example: "What is the capital of France?"
+        tools:
+          type: array
+          nullable: true
+          description: OpenAI-format tool/function definitions.
+          items:
+            type: object
+        stream:
+          type: boolean
+          default: true
+          description: Whether to stream the response as SSE.
+
+    ClassificationEvent:
+      type: object
+      description: |
+        Emitted as `event: classification` during streaming, or nested inside
+        the JSON response for non-streaming requests.
+      required: [label, probabilities, content_length, risk, final]
+      properties:
+        label:
+          type: string
+          example: safe
+        probabilities:
+          type: object
+          additionalProperties:
+            type: number
+        content_length:
+          type: integer
+          description: Number of content characters classified so far.
+        risk:
+          type: integer
+          minimum: 0
+          maximum: 10
+          description: "Aggregate risk score (0 = safe, 10 = maximum risk)."
+        final:
+          type: boolean
+          description: true for the last classification in a stream.
+
+    ChatCompletionWithClassification:
+      type: object
+      description: Standard OpenAI chat completion response with an added classification field.
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+        classification:
+          $ref: "#/components/schemas/ClassificationEvent"
+
+    ModelList:
+      type: object
+      properties:
+        object:
+          type: string
+          example: list
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              object:
+                type: string
+              created:
+                type: integer
+              owned_by:
+                type: string
