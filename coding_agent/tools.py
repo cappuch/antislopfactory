@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 from pathlib import Path
@@ -87,6 +88,28 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bash",
+            "description": (
+                "Execute a bash command in the working directory. "
+                "Use for running scripts, installing packages, git operations, "
+                "builds, tests, and other shell commands."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The bash command to execute"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 120)",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 
@@ -122,6 +145,8 @@ class ToolExecutor:
                 return self._write_file(args)
             case "patch_file":
                 return self._patch_file(args)
+            case "run_bash":
+                return await self._run_bash(args)
             case _:
                 return f"Unknown tool: {name}"
 
@@ -254,3 +279,33 @@ class ToolExecutor:
             diff_text = diff_text[:3000] + "\n... (diff truncated)"
 
         return f"Patched {path_str} (backup: {bak.name})\n\n{diff_text}"
+
+    async def _run_bash(self, args: dict) -> str:
+        command = args.get("command", "")
+        if not command:
+            return "Error: command is required"
+        timeout_secs = args.get("timeout", 120)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.working_dir),
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_secs,
+            )
+            output = ""
+            if stdout:
+                output += stdout.decode("utf-8", errors="replace")
+            if stderr:
+                output += stderr.decode("utf-8", errors="replace")
+            output += f"\n[exit code: {proc.returncode}]"
+            if len(output) > MAX_READ_BYTES:
+                output = output[:MAX_READ_BYTES] + "\n... (output truncated)"
+            return output
+        except asyncio.TimeoutError:
+            proc.kill()
+            return f"Error: command timed out after {timeout_secs} seconds"
+        except Exception as e:
+            return f"Error running command: {e}"

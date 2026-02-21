@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import os
 import sys
 
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 
 from .client import AntiSlopClient, Classification
 from .tools import TOOL_DEFINITIONS, ToolExecutor
+from util.tool_classifier import classify_tool
 
 # ── ANSI colors ───────────────────────────────────────────────────────
 
@@ -29,7 +31,7 @@ UNSAFE_LABELS = frozenset({
 })
 
 SYSTEM_PROMPT = """\
-You are a coding assistant with access to the local filesystem and web search.
+You are a coding assistant with access to the local filesystem, web search, and bash.
 
 Available tools:
 - web_search: search the web for current information
@@ -37,14 +39,15 @@ Available tools:
 - list_files: list directory contents with optional glob pattern
 - write_file: create or overwrite files
 - patch_file: safely edit files with find-and-replace (preferred for existing files)
+- run_bash: execute bash commands (scripts, git, builds, tests, package management, etc.)
 
 When modifying code:
 1. First read the relevant files to understand the current state
 2. Use patch_file for surgical edits (preferred) or write_file for new files
 3. Explain what you changed and why
 
-Always prefer patch_file over write_file for existing files. It validates the exact text \
-being replaced and creates backups automatically."""
+Use run_bash for running tests, installing dependencies, git operations, building projects, \
+and other shell tasks. Always prefer patch_file over write_file for existing files."""
 
 
 # ── display helpers ───────────────────────────────────────────────────
@@ -98,8 +101,55 @@ class CodingAgent:
         self.thread_id = await self.client.create_thread(SYSTEM_PROMPT)
         print(f"{BOLD}antislopfactory coding agent{RESET}")
         print(f"{DIM}thread: {self.thread_id}{RESET}")
-        print(f"{DIM}tools: web_search, read_file, list_files, write_file, patch_file{RESET}")
+        print(f"{DIM}tools: web_search, read_file, list_files, write_file, patch_file, run_bash{RESET}")
         print(f"{DIM}type /quit to exit, /help for commands{RESET}\n")
+
+    async def _classify_and_approve(self, name: str, arguments: str) -> bool:
+        """Classify a tool call and handle approval. Returns True if approved."""
+        try:
+            args_pretty = _json.dumps(_json.loads(arguments), indent=2)
+        except Exception:
+            args_pretty = arguments
+
+        tool_desc = f"Tool: {name}\nArguments:\n{args_pretty}"
+
+        try:
+            raw = await asyncio.to_thread(classify_tool, tool_desc)
+            parsed = _json.loads(raw)
+            classification = parsed.get("classification", "approval_required").strip()
+            thinking = parsed.get("thinking", "")
+        except Exception as e:
+            print(f"{DIM}[classifier error: {e}, defaulting to approval_required]{RESET}")
+            classification = "approval_required"
+            thinking = ""
+
+        if classification == "safe":
+            print(f"{DIM}[{GREEN}safe{RESET}{DIM}]{RESET}")
+            return True
+
+        if classification == "unsafe":
+            print(f"\n{RED}{BOLD}  THIS COMMAND IS UNSAFE.{RESET}")
+            if thinking:
+                print(f"{DIM}  reason: {thinking}{RESET}")
+            try:
+                response = await asyncio.to_thread(
+                    input, f"{RED}  execute anyway? (y/N): {RESET}",
+                )
+            except (EOFError, KeyboardInterrupt):
+                return False
+            return response.strip().lower() in ("y", "yes")
+
+        # approval_required (or unknown)
+        print(f"{YELLOW}[approval required]{RESET}")
+        if thinking:
+            print(f"{DIM}  reason: {thinking}{RESET}")
+        try:
+            response = await asyncio.to_thread(
+                input, f"{YELLOW}  allow? (Y/n): {RESET}",
+            )
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return response.strip().lower() not in ("n", "no")
 
     async def run_turn(self, message: str | None, depth: int = 0) -> None:
         if depth >= 15:
@@ -120,15 +170,22 @@ class CodingAgent:
         if not result.tool_calls:
             return
 
-        # execute tool calls
+        # execute tool calls with classification gate
         tool_results = []
         for tc in result.tool_calls:
             _print_tool_call(tc.name, tc.arguments)
-            try:
-                output = await self.tools.execute(tc.name, tc.arguments)
-            except Exception as e:
-                output = f"Error: {e}"
-            _print_tool_result(tc.name, output)
+
+            approved = await self._classify_and_approve(tc.name, tc.arguments)
+            if not approved:
+                output = "Tool execution denied by user."
+                print(f"{RED}  denied{RESET}\n")
+            else:
+                try:
+                    output = await self.tools.execute(tc.name, tc.arguments)
+                except Exception as e:
+                    output = f"Error: {e}"
+                _print_tool_result(tc.name, output)
+
             tool_results.append({"tool_call_id": tc.id, "content": output})
 
         # submit results and continue
