@@ -27,7 +27,7 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "data/safety_classifier.npz")
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://api.openai.com").rstrip("/")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ALLOWED_MODEL = os.environ.get("ALLOWED_MODEL", "local-proxy-model")
-CLASSIFY_INTERVAL = int(os.environ.get("CLASSIFY_INTERVAL", "500"))
+CLASSIFY_INTERVAL = int(os.environ.get("CLASSIFY_INTERVAL", "0"))
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is required")
@@ -524,9 +524,9 @@ async def chat_message(thread_id: str, req: ChatRequest):
                     # forward original event
                     yield event
 
-                    # periodic classification
+                    # periodic classification (interval=0 means every token)
                     new_chars = len(content_buffer) - last_classified_at
-                    if content_buffer and new_chars >= CLASSIFY_INTERVAL:
+                    if content_buffer and new_chars > 0 and new_chars >= CLASSIFY_INTERVAL:
                         result = await _classify_text(content_buffer)
                         if result:
                             last_classified_at = len(content_buffer)
@@ -535,20 +535,24 @@ async def chat_message(thread_id: str, req: ChatRequest):
                             )
 
     return StreamingResponse(
-        stream_with_classification(), media_type="text/event-stream",
+        stream_with_classification(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-# ── DDG proxy ────────────────────────────────────────────────────────
+# ── web search proxy ─────────────────────────────────────────────────
 
-@app.get("/ddg")
-async def ddg_proxy(q: str = Query(..., description="Search query")):
-    """Search DuckDuckGo and return results."""
-    from duckduckgo_search import DDGS
+@app.get("/search")
+async def search_proxy(q: str = Query(..., description="Search query")):
+    """Search Google and return results."""
+    from googlesearch import search
     loop = asyncio.get_event_loop()
     def _search():
-        with DDGS() as ddgs:
-            return list(ddgs.text(q, max_results=8))
+        return [
+            {"title": r.title, "url": r.url, "description": r.description}
+            for r in search(q, num_results=8, advanced=True)
+        ]
     results = await loop.run_in_executor(None, _search)
     return JSONResponse(content={"results": results})
 

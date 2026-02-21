@@ -44,6 +44,13 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
   display:flex;align-items:center;gap:12px;background:var(--surface);font-size:12px}
 .topbar .thread-id{color:var(--text2);font-size:11px}
 .topbar .model-name{color:var(--accent)}
+.stream-stats{margin-left:auto;display:none;align-items:center;gap:10px;font-size:11px;color:var(--text2)}
+.stream-stats.active{display:flex}
+.stream-stats .live-dot{width:6px;height:6px;border-radius:50%;background:var(--red);
+  animation:pulse 1s ease infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.stat{display:flex;align-items:center;gap:3px}
+.stat .stat-val{color:var(--text);font-weight:600}
 
 /* messages area */
 .messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px}
@@ -51,6 +58,7 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
   white-space:pre-wrap;word-break:break-word}
 .msg.user{background:var(--accent);color:#000;align-self:flex-end;border-bottom-right-radius:2px}
 .msg.assistant{background:var(--surface2);align-self:flex-start;border-bottom-left-radius:2px}
+.msg.assistant.streaming{border-left:2px solid var(--accent)}
 .msg.system{background:var(--surface);color:var(--text2);align-self:center;
   font-size:11px;font-style:italic;border-radius:4px}
 .msg.tool-call{background:#1a1e2a;border:1px solid #2d4a7a;align-self:flex-start;
@@ -59,24 +67,28 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
   font-size:12px;border-bottom-left-radius:2px}
 .msg-label{font-size:10px;font-weight:600;text-transform:uppercase;
   margin-bottom:4px;opacity:.7}
-.msg .reasoning{color:var(--text2);font-size:11px;font-style:italic;
-  border-left:2px solid var(--border);padding-left:8px;margin-bottom:6px}
+
+/* blinking cursor */
+.cursor{display:inline;animation:blink .6s step-end infinite;color:var(--accent)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 
 /* classification panel */
 .classification-panel{background:var(--surface);border-top:1px solid var(--border);
-  padding:10px 16px;font-size:11px}
-.clf-header{display:flex;justify-content:space-between;margin-bottom:6px}
-.clf-label{font-weight:700;text-transform:uppercase}
+  padding:10px 16px;font-size:11px;transition:opacity .2s}
+.clf-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.clf-label{font-weight:700;text-transform:uppercase;font-size:13px}
 .clf-label.safe{color:var(--green)}
 .clf-label.unsafe{color:var(--red)}
-.clf-risk{color:var(--text2)}
+.clf-meta{display:flex;gap:12px;color:var(--text2)}
 .prob-bars{display:flex;flex-wrap:wrap;gap:3px 12px}
 .prob-bar{display:flex;align-items:center;gap:4px;width:calc(50% - 6px)}
 .prob-bar .name{width:100px;text-align:right;color:var(--text2);overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
-.prob-bar .bar{flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden}
-.prob-bar .bar-fill{height:100%;border-radius:3px;transition:width .3s}
-.prob-bar .val{width:40px;font-size:10px;color:var(--text2)}
+  text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+.prob-bar .bar{flex:1;height:8px;background:var(--bg);border-radius:4px;overflow:hidden}
+.prob-bar .bar-fill{height:100%;border-radius:4px;transition:width .15s ease-out,background .15s}
+.prob-bar .val{width:44px;font-size:10px;color:var(--text2);text-align:right;
+  transition:color .15s}
+.prob-bar .val.hot{color:var(--red);font-weight:600}
 
 /* input area */
 .input-area{padding:12px 16px;border-top:1px solid var(--border);
@@ -138,6 +150,13 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
     <div class="topbar">
       <span class="model-name" id="modelName">antislopfactory</span>
       <span class="thread-id" id="threadIdDisplay">no thread selected</span>
+      <div class="stream-stats" id="streamStats">
+        <div class="live-dot"></div>
+        <div class="stat">ttft: <span class="stat-val" id="statTtft">--</span></div>
+        <div class="stat">tok/s: <span class="stat-val" id="statTokSec">--</span></div>
+        <div class="stat">tokens: <span class="stat-val" id="statTokens">0</span></div>
+        <div class="stat">chars: <span class="stat-val" id="statChars">0</span></div>
+      </div>
     </div>
 
     <div class="messages" id="messages">
@@ -152,7 +171,10 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
     <div class="classification-panel" id="clfPanel" style="display:none">
       <div class="clf-header">
         <span class="clf-label" id="clfLabel">--</span>
-        <span class="clf-risk" id="clfRisk">risk: --/10</span>
+        <div class="clf-meta">
+          <span id="clfRisk">risk: --/10</span>
+          <span id="clfChars"></span>
+        </div>
       </div>
       <div class="prob-bars" id="probBars"></div>
     </div>
@@ -176,27 +198,27 @@ html,body{height:100%;font-family:'SF Mono','Cascadia Code','Consolas',monospace
   </div>
 </div>
 
-<!-- sandboxed iframe for JS execution -->
 <iframe id="jsSandbox" sandbox="allow-scripts" style="display:none"></iframe>
 
 <script>
-const API = location.origin;  // same origin as backend
+const API = location.origin;
 
 // ── state ──────────────────────────────────────────────────────────
 let currentThreadId = null;
 let isStreaming = false;
+
+// keep track of prob-bar DOM nodes so we can update in place (no flicker)
+let probBarEls = {};  // name -> {fill, val}
 
 const TOOLS = [
   {
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the web using DuckDuckGo. Returns instant answer summaries and related topics. Use this for factual questions, current events, or when you need to look something up.",
+      description: "Search the web using Google. Returns titles, URLs, and descriptions. Use for factual questions, current events, or when you need to look something up.",
       parameters: {
         type: "object",
-        properties: {
-          query: { type: "string", description: "The search query" }
-        },
+        properties: { query: { type: "string", description: "The search query" } },
         required: ["query"]
       }
     }
@@ -205,16 +227,26 @@ const TOOLS = [
     type: "function",
     function: {
       name: "javascript_sandbox",
-      description: "Execute JavaScript code in a sandboxed environment. Use this for calculations, data processing, generating examples, or any task that benefits from running code. Console.log output and the final expression result are captured and returned.",
+      description: "Execute JavaScript code in a sandboxed environment. Console.log output and the final expression result are captured and returned.",
       parameters: {
         type: "object",
-        properties: {
-          code: { type: "string", description: "JavaScript code to execute" }
-        },
+        properties: { code: { type: "string", description: "JavaScript code to execute" } },
         required: ["code"]
       }
     }
   }
+];
+
+const UNSAFE_LABELS = new Set([
+  'violence','hate','harassment','sexual','self_harm','criminal',
+  'malware','illegal','fraud','harmful','unethical','unsafe_other'
+]);
+
+// fixed ordering so bars don't jump around
+const LABEL_ORDER = [
+  'safe','criminal','deception','fraud','harassment','harmful','hate',
+  'illegal','malware','privacy','professional_advice','self_harm',
+  'sexual','unethical','unsafe_other','violence'
 ];
 
 // ── thread management ──────────────────────────────────────────────
@@ -277,23 +309,16 @@ async function loadMessages() {
     } else if (m.role === 'user') {
       addMessageBubble('user', m.content);
     } else if (m.role === 'assistant') {
-      let text = '';
-      if (m.reasoning_content) text += m.reasoning_content + '\n\n';
-      text += m.content;
-      // show tool calls if present
       if (m.metadata?.tool_calls) {
-        for (const tc of m.metadata.tool_calls) {
-          addToolCallBubble(tc);
-        }
+        for (const tc of m.metadata.tool_calls) addToolCallBubble(tc);
       }
-      if (m.content) addMessageBubble('assistant', text);
-      // show classification
+      if (m.content) addMessageBubble('assistant', m.content);
       if (m.metadata?.classification) {
         updateClassification({
           label: m.metadata.classification.label,
           probabilities: m.metadata.classification.probabilities,
           risk: m.metadata.classification.risk ?? 0,
-          final: true
+          content_length: 0, final: true
         });
       }
     } else if (m.role === 'tool') {
@@ -342,10 +367,33 @@ function esc(s) {
 }
 
 // ── classification display ─────────────────────────────────────────
-const UNSAFE_LABELS = new Set([
-  'violence','hate','harassment','sexual','self_harm','criminal',
-  'malware','illegal','fraud','harmful','unethical','unsafe_other'
-]);
+function initProbBars() {
+  const bars = document.getElementById('probBars');
+  bars.innerHTML = '';
+  probBarEls = {};
+  for (const name of LABEL_ORDER) {
+    const row = document.createElement('div');
+    row.className = 'prob-bar';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'name';
+    nameSpan.textContent = name;
+    const barOuter = document.createElement('div');
+    barOuter.className = 'bar';
+    const fill = document.createElement('div');
+    fill.className = 'bar-fill';
+    fill.style.width = '0%';
+    fill.style.background = 'var(--green)';
+    barOuter.appendChild(fill);
+    const val = document.createElement('span');
+    val.className = 'val';
+    val.textContent = '0.0%';
+    row.appendChild(nameSpan);
+    row.appendChild(barOuter);
+    row.appendChild(val);
+    bars.appendChild(row);
+    probBarEls[name] = { fill, val };
+  }
+}
 
 function updateClassification(clf) {
   const panel = document.getElementById('clfPanel');
@@ -354,34 +402,39 @@ function updateClassification(clf) {
   labelEl.textContent = clf.label;
   labelEl.className = 'clf-label ' + (UNSAFE_LABELS.has(clf.label) ? 'unsafe' : 'safe');
   document.getElementById('clfRisk').textContent = `risk: ${clf.risk}/10`;
+  if (clf.content_length) {
+    document.getElementById('clfChars').textContent = `@ ${clf.content_length} chars`;
+  }
 
-  const bars = document.getElementById('probBars');
-  bars.innerHTML = '';
-  // sort by probability descending
-  const sorted = Object.entries(clf.probabilities).sort((a, b) => b[1] - a[1]);
-  for (const [name, prob] of sorted) {
+  // init bars on first classification
+  if (!Object.keys(probBarEls).length) initProbBars();
+
+  // update each bar in place — no DOM rebuild, smooth transitions
+  for (const name of LABEL_ORDER) {
+    const prob = clf.probabilities[name] ?? 0;
     const pct = (prob * 100).toFixed(1);
-    const color = UNSAFE_LABELS.has(name)
+    const el = probBarEls[name];
+    if (!el) continue;
+    const isUnsafe = UNSAFE_LABELS.has(name);
+    const color = isUnsafe
       ? `hsl(${Math.max(0, 120 - prob * 400)}, 80%, 50%)`
       : 'var(--green)';
-    bars.innerHTML += `
-      <div class="prob-bar">
-        <span class="name">${esc(name)}</span>
-        <div class="bar"><div class="bar-fill" style="width:${pct}%;background:${color}"></div></div>
-        <span class="val">${pct}%</span>
-      </div>`;
+    el.fill.style.width = pct + '%';
+    el.fill.style.background = color;
+    el.val.textContent = pct + '%';
+    el.val.className = prob > 0.1 && isUnsafe ? 'val hot' : 'val';
   }
 }
 
 // ── tool execution ─────────────────────────────────────────────────
 async function executeWebSearch(query) {
   try {
-    const r = await fetch(`${API}/ddg?q=${encodeURIComponent(query)}`);
+    const r = await fetch(`${API}/search?q=${encodeURIComponent(query)}`);
     const data = await r.json();
     if (!data.results?.length) return 'No results found for this query.';
     let out = '';
     for (const item of data.results) {
-      out += `${item.title}\n${item.href}\n${item.body}\n\n`;
+      out += `${item.title}\n${item.url}\n${item.description}\n\n`;
     }
     return out.trim();
   } catch (e) {
@@ -429,12 +482,8 @@ function executeJsSandbox(code) {
 async function executeTool(name, argsStr) {
   let args;
   try { args = JSON.parse(argsStr); } catch { args = {}; }
-
-  if (name === 'web_search') {
-    return await executeWebSearch(args.query || '');
-  } else if (name === 'javascript_sandbox') {
-    return await executeJsSandbox(args.code || '');
-  }
+  if (name === 'web_search') return await executeWebSearch(args.query || '');
+  if (name === 'javascript_sandbox') return await executeJsSandbox(args.code || '');
   return `Unknown tool: ${name}`;
 }
 
@@ -446,7 +495,6 @@ async function sendMessage() {
   if (!text) return;
   input.value = '';
   input.style.height = 'auto';
-
   addMessageBubble('user', text);
   await streamChat(text);
 }
@@ -455,90 +503,155 @@ async function streamChat(message) {
   isStreaming = true;
   document.getElementById('sendBtn').disabled = true;
 
+  // show live stats
+  const statsEl = document.getElementById('streamStats');
+  const statTtft = document.getElementById('statTtft');
+  const statTokSec = document.getElementById('statTokSec');
+  const statTokens = document.getElementById('statTokens');
+  const statChars = document.getElementById('statChars');
+  statsEl.classList.add('active');
+  statTtft.textContent = '--';
+  statTokSec.textContent = '--';
+  statTokens.textContent = '0';
+  statChars.textContent = '0';
+  let tokenCount = 0;
+  let chunkCount = 0;
+  let ttft = null;  // time to first token (ms)
+  let firstTokenTime = null;
+  const streamStart = performance.now();
+
+  // show classification panel immediately with zeroed bars
+  document.getElementById('clfPanel').style.display = '';
+  document.getElementById('clfLabel').textContent = 'waiting...';
+  document.getElementById('clfLabel').className = 'clf-label';
+  document.getElementById('clfRisk').textContent = 'risk: --/10';
+  document.getElementById('clfChars').textContent = '';
+  initProbBars();
+
   const body = { tools: TOOLS, stream: true };
   if (message !== null) body.message = message;
 
   const resp = await fetch(`${API}/threads/${currentThreadId}/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
     body: JSON.stringify(body)
   });
 
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
+  const messagesEl = document.getElementById('messages');
   let contentBubble = null;
   let contentText = '';
   let reasoningText = '';
-  // accumulate tool_calls from deltas
-  let toolCalls = {};  // index -> {id, name, arguments}
+  let toolCalls = {};
+  // cursor element for live typing effect
+  let cursorEl = null;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+  function ensureBubble() {
+    if (!contentBubble) {
+      contentBubble = document.createElement('div');
+      contentBubble.className = 'msg assistant streaming';
+      messagesEl.appendChild(contentBubble);
+      cursorEl = document.createElement('span');
+      cursorEl.className = 'cursor';
+      cursorEl.textContent = '\u2588';
+      contentBubble.appendChild(cursorEl);
+    }
+  }
 
-    // process complete SSE events
-    let idx;
-    while ((idx = buf.indexOf('\n\n')) !== -1) {
-      const block = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
+  function updateBubble() {
+    ensureBubble();
+    // set text, keep cursor at end
+    contentBubble.textContent = contentText;
+    contentBubble.appendChild(cursorEl);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 
-      let eventType = null;
-      const dataLines = [];
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event:')) eventType = line.slice(6).trim();
-        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  function updateStats() {
+    statTokens.textContent = tokenCount;
+    statChars.textContent = contentText.length;
+    if (ttft !== null) {
+      statTtft.textContent = ttft + 'ms';
+      // tok/s measured from first token (excludes TTFT wait)
+      const sinceFirst = (performance.now() - firstTokenTime) / 1000;
+      statTokSec.textContent = sinceFirst > 0.05 ? (tokenCount / sinceFirst).toFixed(1) : '--';
+    }
+  }
+
+  function processEvent(block) {
+    let eventType = null;
+    const dataLines = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) eventType = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    for (const raw of dataLines) {
+      if (raw === '[DONE]') continue;
+      let obj;
+      try { obj = JSON.parse(raw); } catch { continue; }
+
+      if (eventType === 'classification') {
+        updateClassification(obj);
+        continue;
       }
 
-      for (const data of dataLines) {
-        if (data === '[DONE]') continue;
-        let obj;
-        try { obj = JSON.parse(data); } catch { continue; }
+      for (const choice of obj.choices || []) {
+        const delta = choice.delta || {};
 
-        if (eventType === 'classification') {
-          updateClassification(obj);
-          continue;
+        if (typeof delta.content === 'string' && delta.content) {
+          if (ttft === null) {
+            ttft = Math.round(performance.now() - streamStart);
+            firstTokenTime = performance.now();
+          }
+          chunkCount++;
+          tokenCount++;
+          contentText += delta.content;
+          updateBubble();
+          updateStats();
         }
 
-        // standard chat completion chunk
-        for (const choice of obj.choices || []) {
-          const delta = choice.delta || {};
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+          reasoningText += delta.reasoning_content;
+        }
 
-          // content
-          if (typeof delta.content === 'string' && delta.content) {
-            contentText += delta.content;
-            if (!contentBubble) {
-              contentBubble = addMessageBubble('assistant', '');
-            }
-            contentBubble.textContent = contentText;
-            document.getElementById('messages').scrollTop =
-              document.getElementById('messages').scrollHeight;
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const i = tc.index ?? 0;
+            if (!toolCalls[i]) toolCalls[i] = { id: '', name: '', arguments: '' };
+            if (tc.id) toolCalls[i].id = tc.id;
+            if (tc.function?.name) toolCalls[i].name = tc.function.name;
+            if (tc.function?.arguments) toolCalls[i].arguments += tc.function.arguments;
           }
-
-          // reasoning
-          if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
-            reasoningText += delta.reasoning_content;
-          }
-
-          // tool_calls
-          if (delta.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const i = tc.index ?? 0;
-              if (!toolCalls[i]) {
-                toolCalls[i] = { id: '', name: '', arguments: '' };
-              }
-              if (tc.id) toolCalls[i].id = tc.id;
-              if (tc.function?.name) toolCalls[i].name = tc.function.name;
-              if (tc.function?.arguments) toolCalls[i].arguments += tc.function.arguments;
-            }
-          }
+          chunkCount++;
+          updateStats();
         }
       }
     }
   }
 
-  // handle tool calls if any
+  // read stream
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const block = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      if (block.trim()) processEvent(block);
+    }
+  }
+  if (buf.trim()) processEvent(buf);
+
+  // stream done — remove cursor, unmark streaming
+  if (contentBubble) {
+    if (cursorEl && cursorEl.parentNode) cursorEl.remove();
+    contentBubble.classList.remove('streaming');
+  }
+  statsEl.classList.remove('active');
+
   const tcList = Object.values(toolCalls);
   if (tcList.length > 0 && tcList[0].id) {
     await handleToolCalls(tcList);
@@ -550,14 +663,10 @@ async function streamChat(message) {
 }
 
 async function handleToolCalls(toolCallsList) {
-  // display tool calls
   for (const tc of toolCallsList) {
-    addToolCallBubble({
-      function: { name: tc.name, arguments: tc.arguments }
-    });
+    addToolCallBubble({ function: { name: tc.name, arguments: tc.arguments } });
   }
 
-  // execute tools
   const toolStatusEl = document.getElementById('toolStatus');
   const toolStatusText = document.getElementById('toolStatusText');
   toolStatusEl.classList.add('active');
@@ -570,7 +679,6 @@ async function handleToolCalls(toolCallsList) {
     addToolResultBubble(tc.id, output);
   }
 
-  // submit results to backend
   toolStatusText.textContent = 'submitting results...';
   await fetch(`${API}/threads/${currentThreadId}/tool_results`, {
     method: 'POST',
@@ -578,10 +686,8 @@ async function handleToolCalls(toolCallsList) {
     body: JSON.stringify({ tool_results: results })
   });
 
-  // continue the conversation
-  toolStatusText.textContent = 'continuing...';
   toolStatusEl.classList.remove('active');
-  await streamChat(null);  // null message = continue without new user msg
+  await streamChat(null);
 }
 
 // ── textarea auto-resize ───────────────────────────────────────────
