@@ -9,8 +9,10 @@ from typing import Any
 import httpx
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from db import ThreadStore, genid
@@ -60,6 +62,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="antislopfactory", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ── schemas ───────────────────────────────────────────────────────────
@@ -87,9 +95,18 @@ class MakeThreadResponse(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str | None = None
     tools: list[dict[str, Any]] | None = None
     stream: bool = True
+
+
+class ToolResult(BaseModel):
+    tool_call_id: str
+    content: str
+
+
+class ToolResultsRequest(BaseModel):
+    tool_results: list[ToolResult]
 
 
 class ThreadSummary(BaseModel):
@@ -307,6 +324,20 @@ async def make_thread(req: MakeThreadRequest):
     return MakeThreadResponse(thread_id=thread_id)
 
 
+@app.post("/threads/{thread_id}/tool_results")
+async def submit_tool_results(thread_id: str, req: ToolResultsRequest):
+    """Submit tool execution results to a thread."""
+    thread = await store.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(404, "thread not found")
+    for tr in req.tool_results:
+        await store.append_message(
+            thread_id, "tool", tr.content,
+            metadata={"tool_call_id": tr.tool_call_id},
+        )
+    return {"ok": True}
+
+
 @app.post("/threads/{thread_id}/chat")
 async def chat_message(thread_id: str, req: ChatRequest):
     """Send a user message and get a classified, streamed response."""
@@ -314,8 +345,9 @@ async def chat_message(thread_id: str, req: ChatRequest):
     if thread is None:
         raise HTTPException(404, "thread not found")
 
-    # persist user message
-    await store.append_message(thread_id, "user", req.message)
+    # persist user message (skip when continuing after tool results)
+    if req.message is not None:
+        await store.append_message(thread_id, "user", req.message)
 
     # build full conversation for upstream
     messages = await _build_upstream_messages(thread_id)
@@ -394,6 +426,7 @@ async def chat_message(thread_id: str, req: ChatRequest):
     async def stream_with_classification():
         content_buffer = ""
         reasoning_buffer = ""
+        tool_calls_buf: dict[int, dict] = {}  # index -> accumulated tool_call
         last_classified_at = 0
 
         timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=60.0)
@@ -425,11 +458,33 @@ async def chat_message(thread_id: str, req: ChatRequest):
                                 r = delta.get("reasoning_content")
                                 if isinstance(r, str):
                                     reasoning_buffer += r
+                                for tc in delta.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    if idx not in tool_calls_buf:
+                                        tool_calls_buf[idx] = {
+                                            "id": tc.get("id", ""),
+                                            "type": tc.get("type", "function"),
+                                            "function": {"name": "", "arguments": ""},
+                                        }
+                                    if tc.get("id"):
+                                        tool_calls_buf[idx]["id"] = tc["id"]
+                                    fn = tc.get("function") or {}
+                                    if fn.get("name"):
+                                        tool_calls_buf[idx]["function"]["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        tool_calls_buf[idx]["function"]["arguments"] += fn["arguments"]
                         except Exception:
                             pass
 
                     if is_done:
-                        # final classification before [DONE]
+                        accumulated_tc = (
+                            [tool_calls_buf[i] for i in sorted(tool_calls_buf)]
+                            if tool_calls_buf else []
+                        )
+                        meta: dict[str, Any] = {}
+                        if accumulated_tc:
+                            meta["tool_calls"] = accumulated_tc
+
                         if content_buffer:
                             result = await _classify_text(content_buffer)
                             if result:
@@ -437,7 +492,7 @@ async def chat_message(thread_id: str, req: ChatRequest):
                                 yield _make_classification_event(
                                     result, len(content_buffer), final=True,
                                 )
-                                # persist
+                                meta["classification"] = result
                                 emb_array = None
                                 try:
                                     emb = await embed(content_buffer)
@@ -447,16 +502,22 @@ async def chat_message(thread_id: str, req: ChatRequest):
                                 await store.append_message(
                                     thread_id, "assistant", content_buffer,
                                     reasoning_content=reasoning_buffer,
-                                    metadata={"classification": result},
+                                    metadata=meta or None,
                                     embedding=emb_array,
                                 )
                                 await store.update_risk(thread_id, risk)
                             else:
-                                # no classification, still persist
                                 await store.append_message(
                                     thread_id, "assistant", content_buffer,
                                     reasoning_content=reasoning_buffer,
+                                    metadata=meta or None,
                                 )
+                        elif accumulated_tc:
+                            # tool-calls-only response (no content)
+                            await store.append_message(
+                                thread_id, "assistant", "",
+                                metadata=meta,
+                            )
                         yield event
                         return
 
@@ -476,3 +537,23 @@ async def chat_message(thread_id: str, req: ChatRequest):
     return StreamingResponse(
         stream_with_classification(), media_type="text/event-stream",
     )
+
+
+# ── DDG proxy ────────────────────────────────────────────────────────
+
+@app.get("/ddg")
+async def ddg_proxy(q: str = Query(..., description="Search query")):
+    """Proxy DuckDuckGo instant answer API (avoids browser CORS)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            "https://api.duckduckgo.com/",
+            params={"q": q, "format": "json", "no_html": "1", "skip_disambig": "1"},
+        )
+    return JSONResponse(content=r.json())
+
+
+# ── static frontend ──────────────────────────────────────────────────
+
+_frontend = Path(__file__).parent / "toy_frontend"
+if _frontend.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(_frontend), html=True), name="ui")
