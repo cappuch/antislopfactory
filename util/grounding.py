@@ -57,7 +57,7 @@ User message: {user_message}"""
                 {"role": "system", "content": "You decide if a message needs web search grounding. Set needs_search=false and queries=[] to skip. Set needs_search=true with 3-5 queries to search."},
                 {"role": "user", "content": prompt},
             ],
-            model="llama-4-scout-17b-16e-instruct",
+            model="gpt-oss-120b",
             max_completion_tokens=256,
             temperature=0.4,
             response_format={"type": "json_schema", "json_schema": QUERY_SCHEMA},
