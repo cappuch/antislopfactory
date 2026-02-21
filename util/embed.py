@@ -1,8 +1,12 @@
 import json
+import os
 import urllib.request
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_URL = "https://infer.dev.takara.ai/"
-API_KEY = "EzjkCZ6r1kqhLJGPSsSNmDTGZvZGRbHrmU3cmRkcVlw"
+API_KEY = os.environ["ds1_api_key"]
 
 
 def embed(inputs: str | list[str]) -> list[list[float]]:
