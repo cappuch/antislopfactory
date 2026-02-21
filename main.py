@@ -641,16 +641,20 @@ async def chat_message(thread_id: str, req: ChatRequest):
 
 @app.get("/search")
 async def search_proxy(q: str = Query(..., description="Search query")):
-    """Search Google and return results."""
-    from googlesearch import search
-    loop = asyncio.get_event_loop()
-    def _search():
-        return [
-            {"title": r.title, "url": r.url, "description": r.description}
-            for r in search(q, num_results=8, advanced=True)
-        ]
-    results = await loop.run_in_executor(None, _search)
-    return JSONResponse(content={"results": results})
+    """Search with Exa and return results."""
+    from util.grounding import _exa
+    if _exa is None:
+        raise HTTPException(503, "EXA_API_KEY not configured")
+    results = await _exa.search(
+        q,
+        num_results=8,
+        type="auto",
+        contents={"text": {"max_characters": 1000}},
+    )
+    return JSONResponse(content={"results": [
+        {"title": r.title or "", "url": r.url, "description": (r.text or "")[:500]}
+        for r in results.results
+    ]})
 
 
 # ── static frontend ──────────────────────────────────────────────────
