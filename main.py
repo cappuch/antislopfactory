@@ -543,13 +543,14 @@ async def chat_message(thread_id: str, req: ChatRequest):
 
 @app.get("/ddg")
 async def ddg_proxy(q: str = Query(..., description="Search query")):
-    """Proxy DuckDuckGo instant answer API (avoids browser CORS)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(
-            "https://api.duckduckgo.com/",
-            params={"q": q, "format": "json", "no_html": "1", "skip_disambig": "1"},
-        )
-    return JSONResponse(content=r.json())
+    """Search DuckDuckGo and return results."""
+    from duckduckgo_search import DDGS
+    loop = asyncio.get_event_loop()
+    def _search():
+        with DDGS() as ddgs:
+            return list(ddgs.text(q, max_results=8))
+    results = await loop.run_in_executor(None, _search)
+    return JSONResponse(content={"results": results})
 
 
 # ── static frontend ──────────────────────────────────────────────────

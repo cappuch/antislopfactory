@@ -378,24 +378,12 @@ async function executeWebSearch(query) {
   try {
     const r = await fetch(`${API}/ddg?q=${encodeURIComponent(query)}`);
     const data = await r.json();
-    let result = '';
-    if (data.AbstractText) {
-      result += `Summary: ${data.AbstractText}\n`;
-      if (data.AbstractURL) result += `Source: ${data.AbstractURL}\n`;
+    if (!data.results?.length) return 'No results found for this query.';
+    let out = '';
+    for (const item of data.results) {
+      out += `${item.title}\n${item.href}\n${item.body}\n\n`;
     }
-    if (data.Answer) result += `Answer: ${data.Answer}\n`;
-    if (data.RelatedTopics?.length) {
-      result += '\nRelated:\n';
-      for (const t of data.RelatedTopics.slice(0, 8)) {
-        if (t.Text) result += `- ${t.Text}\n`;
-        if (t.Topics) {
-          for (const sub of t.Topics.slice(0, 3)) {
-            if (sub.Text) result += `  - ${sub.Text}\n`;
-          }
-        }
-      }
-    }
-    return result || 'No results found for this query.';
+    return out.trim();
   } catch (e) {
     return `Search error: ${e.message}`;
   }
