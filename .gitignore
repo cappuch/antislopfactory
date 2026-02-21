@@ -6,3 +6,5 @@ data/*
 !data/safety_classifier.npz
 !data/safety_classifier.png
 !data/safety_classifier.json
+
+__pycache__/

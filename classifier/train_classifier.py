@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -8,6 +9,9 @@ from pathlib import Path
 import aiohttp
 import numpy as np
 from datasets import load_dataset
+
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from util.classifier import MLPClassifier
 from util.embed import embed
