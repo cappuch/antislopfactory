@@ -1,6 +1,8 @@
 # antislopfactory
 ^ hopefully temporary name
 
+powered by takara.ai's ds-1, a high-performance low latency embedding model.
+
 ## features
 - tool-level classification
 - message-level safety classification
