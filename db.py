@@ -45,7 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
 
 
 def genid() -> str:
-    """Generate a compact time-sortable ID: 8-char hex timestamp + 6-char random."""
+    """Generate a compact time-sortable ID: 11-char hex timestamp + 6-char random."""
     t = int(time.time() * 1000)
     return f"{t:011x}-{secrets.token_hex(3)}"
 
