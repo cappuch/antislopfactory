@@ -197,12 +197,14 @@ class ThreadStore:
 
         rows = self._conn().execute(sql, params).fetchall()
         out = []
+        np = None
         for row in rows:
             d = dict(row)
             if d["metadata"] is not None:
                 d["metadata"] = json.loads(d["metadata"])
             if d["embedding"] is not None:
-                import numpy as np
+                if np is None:
+                    import numpy as np
                 d["embedding"] = np.frombuffer(d["embedding"], dtype=np.float32)
             out.append(d)
         return out
