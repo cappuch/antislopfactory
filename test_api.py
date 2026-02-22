@@ -14,143 +14,166 @@ Usage:
 import argparse
 import json
 import sys
-import time
 
 import httpx
 
 DEFAULT_BASE = "http://localhost:8080"
 TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=30.0)
 
-passed = 0
-failed = 0
+
+class SSEParser:
+    """Incremental SSE event parser."""
+
+    def __init__(self):
+        self._buf = b""
+
+    def feed(self, chunk: bytes) -> list[tuple[str | None, str]]:
+        self._buf += chunk
+        events = []
+        while (sep := self._buf.find(b"\n\n")) != -1:
+            frame = self._buf[:sep].decode("utf-8", errors="replace")
+            self._buf = self._buf[sep + 2:]
+
+            event_type = None
+            for line in frame.split("\n"):
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    events.append((event_type, line[5:].strip()))
+        return events
 
 
-def ok(name: str, detail: str = ""):
-    global passed
-    passed += 1
-    print(f"  \033[32mPASS\033[0m  {name}" + (f"  ({detail})" if detail else ""))
+class TestRunner:
+    def __init__(self, base_url: str):
+        self.client = httpx.Client(base_url=base_url, timeout=TIMEOUT)
+        self.passed = 0
+        self.failed = 0
 
+    def ok(self, name: str, detail: str = "") -> None:
+        self.passed += 1
+        print(f"  \033[32mPASS\033[0m  {name}" + (f"  ({detail})" if detail else ""))
 
-def fail(name: str, detail: str = ""):
-    global failed
-    failed += 1
-    print(f"  \033[31mFAIL\033[0m  {name}" + (f"  ({detail})" if detail else ""))
+    def fail(self, name: str, detail: str = "") -> None:
+        self.failed += 1
+        print(f"  \033[31mFAIL\033[0m  {name}" + (f"  ({detail})" if detail else ""))
 
+    def close(self) -> None:
+        self.client.close()
 
-# ── tests ─────────────────────────────────────────────────────────────
+    def summary(self) -> int:
+        total = self.passed + self.failed
+        color = "\033[32m" if self.failed == 0 else "\033[31m"
+        print(f"\n{'─' * 44}")
+        print(f"{color}{self.passed}/{total} passed\033[0m\n")
+        return 0 if self.failed == 0 else 1
 
-def test_health(c: httpx.Client):
-    r = c.get("/health")
-    if r.status_code == 200 and r.json().get("status") == "ok":
-        ok("GET /health", f"model_loaded={r.json()['model_loaded']}")
-    else:
-        fail("GET /health", r.text[:200])
+    # ── tests ─────────────────────────────────────────────────────────
 
+    def test_health(self) -> None:
+        r = self.client.get("/health")
+        if r.status_code == 200 and r.json().get("status") == "ok":
+            self.ok("GET /health", f"model_loaded={r.json()['model_loaded']}")
+        else:
+            self.fail("GET /health", r.text[:200])
 
-def test_models(c: httpx.Client):
-    r = c.get("/v1/models")
-    data = r.json()
-    models = data.get("data", [])
-    if r.status_code == 200 and len(models) >= 1:
-        ok("GET /v1/models", f"model={models[0]['id']}")
-    else:
-        fail("GET /v1/models", r.text[:200])
+    def test_models(self) -> None:
+        r = self.client.get("/v1/models")
+        data = r.json()
+        models = data.get("data", [])
+        if r.status_code == 200 and len(models) >= 1:
+            self.ok("GET /v1/models", f"model={models[0]['id']}")
+        else:
+            self.fail("GET /v1/models", r.text[:200])
 
+    def test_openapi(self) -> None:
+        r = self.client.get("/openapi.json")
+        if r.status_code == 200 and "paths" in r.json():
+            paths = list(r.json()["paths"].keys())
+            self.ok("GET /openapi.json", f"paths={paths}")
+        else:
+            self.fail("GET /openapi.json", r.text[:200])
 
-def test_classify(c: httpx.Client):
-    r = c.post("/classify", json={"text": "Hello, how are you?"})
-    if r.status_code == 200:
-        result = r.json()["results"][0]
-        ok("POST /classify", f"label={result['label']}  top_prob={max(result['probabilities'].values()):.3f}")
-    elif r.status_code == 503:
-        ok("POST /classify (skipped)", "model not loaded")
-    else:
-        fail("POST /classify", r.text[:200])
+    def test_classify(self) -> None:
+        r = self.client.post("/classify", json={"text": "Hello, how are you?"})
+        if r.status_code == 200:
+            result = r.json()["results"][0]
+            self.ok("POST /classify", f"label={result['label']}  top_prob={max(result['probabilities'].values()):.3f}")
+        elif r.status_code == 503:
+            self.ok("POST /classify (skipped)", "model not loaded")
+        else:
+            self.fail("POST /classify", r.text[:200])
 
+    def test_classify_batch(self) -> None:
+        r = self.client.post("/classify", json={"text": ["I love cats", "How to hack a computer"]})
+        if r.status_code == 200:
+            results = r.json()["results"]
+            labels = [res["label"] for res in results]
+            self.ok("POST /classify (batch)", f"labels={labels}")
+        elif r.status_code == 503:
+            self.ok("POST /classify batch (skipped)", "model not loaded")
+        else:
+            self.fail("POST /classify (batch)", r.text[:200])
 
-def test_classify_batch(c: httpx.Client):
-    r = c.post("/classify", json={"text": ["I love cats", "How to hack a computer"]})
-    if r.status_code == 200:
-        results = r.json()["results"]
-        labels = [res["label"] for res in results]
-        ok("POST /classify (batch)", f"labels={labels}")
-    elif r.status_code == 503:
-        ok("POST /classify batch (skipped)", "model not loaded")
-    else:
-        fail("POST /classify (batch)", r.text[:200])
+    def test_thread_not_found(self) -> None:
+        r = self.client.post(
+            "/threads/nonexistent-thread-id/chat",
+            json={"message": "hello", "stream": False},
+        )
+        if r.status_code == 404:
+            self.ok("POST /chat (404)", "thread not found handled")
+        else:
+            self.fail("POST /chat (404)", f"expected 404, got {r.status_code}")
 
-
-def test_make_thread(c: httpx.Client) -> str | None:
-    r = c.post("/threads", json={"system_prompt": "You are a helpful assistant. Keep answers brief."})
-    if r.status_code == 200 and r.json().get("thread_id"):
-        tid = r.json()["thread_id"]
-        ok("POST /threads", f"thread_id={tid}")
-        return tid
-    else:
-        fail("POST /threads", r.text[:200])
+    def test_make_thread(self) -> str | None:
+        r = self.client.post("/threads", json={"system_prompt": "You are a helpful assistant. Keep answers brief."})
+        if r.status_code == 200 and r.json().get("thread_id"):
+            tid = r.json()["thread_id"]
+            self.ok("POST /threads", f"thread_id={tid}")
+            return tid
+        self.fail("POST /threads", r.text[:200])
         return None
 
-
-def test_chat_nonstream(c: httpx.Client, thread_id: str):
-    r = c.post(
-        f"/threads/{thread_id}/chat",
-        json={"message": "What is 2+2? One word.", "stream": False},
-    )
-    if r.status_code != 200:
-        fail("POST /chat (non-stream)", f"status={r.status_code} {r.text[:200]}")
-        return
-
-    data = r.json()
-    content = ""
-    for choice in data.get("choices", []):
-        msg = choice.get("message", {})
-        if msg.get("content"):
-            content += msg["content"]
-
-    clf = data.get("classification")
-    detail = f"content={content[:80]!r}"
-    if clf:
-        detail += f"  label={clf['label']}  risk={clf['risk']}"
-    ok("POST /chat (non-stream)", detail)
-
-
-def test_chat_stream(c: httpx.Client, thread_id: str):
-    """Test streaming chat with SSE parsing."""
-    with c.stream(
-        "POST",
-        f"/threads/{thread_id}/chat",
-        json={"message": "Name three primary colors. Just list them.", "stream": True},
-    ) as r:
+    def test_chat_nonstream(self, thread_id: str) -> None:
+        r = self.client.post(
+            f"/threads/{thread_id}/chat",
+            json={"message": "What is 2+2? One word.", "stream": False},
+        )
         if r.status_code != 200:
-            body = r.read()
-            fail("POST /chat (stream)", f"status={r.status_code} {body[:200]}")
+            self.fail("POST /chat (non-stream)", f"status={r.status_code} {r.text[:200]}")
             return
 
-        content_tokens = 0
-        classifications = []
-        full_content = ""
-        done = False
+        data = r.json()
+        content = ""
+        for choice in data.get("choices", []):
+            msg = choice.get("message", {})
+            if msg.get("content"):
+                content += msg["content"]
 
-        buf = b""
-        for chunk in r.iter_bytes():
-            buf += chunk
-            while True:
-                sep = buf.find(b"\n\n")
-                if sep == -1:
-                    break
-                event_bytes = buf[: sep + 2]
-                buf = buf[sep + 2 :]
+        clf = data.get("classification")
+        detail = f"content={content[:80]!r}"
+        if clf:
+            detail += f"  label={clf['label']}  risk={clf['risk']}"
+        self.ok("POST /chat (non-stream)", detail)
 
-                # parse event type and data
-                event_type = None
-                data_lines = []
-                for line in event_bytes.decode("utf-8", errors="replace").split("\n"):
-                    if line.startswith("event:"):
-                        event_type = line[len("event:"):].strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line[len("data:"):].strip())
+    def test_chat_stream(self, thread_id: str) -> None:
+        with self.client.stream(
+            "POST",
+            f"/threads/{thread_id}/chat",
+            json={"message": "Name three primary colors. Just list them.", "stream": True},
+        ) as r:
+            if r.status_code != 200:
+                body = r.read()
+                self.fail("POST /chat (stream)", f"status={r.status_code} {body[:200]}")
+                return
 
-                for data_str in data_lines:
+            parser = SSEParser()
+            content_tokens = 0
+            classifications = []
+            full_content = ""
+            done = False
+
+            for chunk in r.iter_bytes():
+                for event_type, data_str in parser.feed(chunk):
                     if data_str == "[DONE]":
                         done = True
                         continue
@@ -164,44 +187,23 @@ def test_chat_stream(c: httpx.Client, thread_id: str):
                         classifications.append(obj)
                     else:
                         for choice in obj.get("choices", []):
-                            delta = choice.get("delta", {})
-                            c_text = delta.get("content")
-                            if isinstance(c_text, str) and c_text:
+                            token = choice.get("delta", {}).get("content")
+                            if isinstance(token, str) and token:
                                 content_tokens += 1
-                                full_content += c_text
+                                full_content += token
 
-        detail = f"tokens={content_tokens}  content={full_content[:80]!r}"
-        detail += f"  classifications={len(classifications)}"
-        if classifications:
-            final = next((c for c in classifications if c.get("final")), classifications[-1])
-            detail += f"  final_label={final['label']}  risk={final['risk']}"
+            detail = f"tokens={content_tokens}  content={full_content[:80]!r}"
+            detail += f"  classifications={len(classifications)}"
+            if classifications:
+                final = next((cl for cl in classifications if cl.get("final")), classifications[-1])
+                detail += f"  final_label={final['label']}  risk={final['risk']}"
 
-        if done and content_tokens > 0:
-            ok("POST /chat (stream)", detail)
-        elif content_tokens == 0:
-            fail("POST /chat (stream)", f"no content received. {detail}")
-        else:
-            fail("POST /chat (stream)", f"no [DONE]. {detail}")
-
-
-def test_thread_not_found(c: httpx.Client):
-    r = c.post(
-        "/threads/nonexistent-thread-id/chat",
-        json={"message": "hello", "stream": False},
-    )
-    if r.status_code == 404:
-        ok("POST /chat (404)", "thread not found handled")
-    else:
-        fail("POST /chat (404)", f"expected 404, got {r.status_code}")
-
-
-def test_openapi(c: httpx.Client):
-    r = c.get("/openapi.json")
-    if r.status_code == 200 and "paths" in r.json():
-        paths = list(r.json()["paths"].keys())
-        ok("GET /openapi.json", f"paths={paths}")
-    else:
-        fail("GET /openapi.json", r.text[:200])
+            if done and content_tokens > 0:
+                self.ok("POST /chat (stream)", detail)
+            elif content_tokens == 0:
+                self.fail("POST /chat (stream)", f"no content received. {detail}")
+            else:
+                self.fail("POST /chat (stream)", f"no [DONE]. {detail}")
 
 
 # ── main ──────────────────────────────────────────────────────────────
@@ -214,43 +216,37 @@ def main():
     base = args.base.rstrip("/")
     print(f"\ntesting against {base}\n")
 
-    c = httpx.Client(base_url=base, timeout=TIMEOUT)
+    t = TestRunner(base)
 
-    # check server is up
     try:
-        c.get("/health")
+        t.client.get("/health")
     except httpx.ConnectError:
         print(f"\033[31mERROR\033[0m  cannot connect to {base}")
         print("       start the server first: uv run uvicorn main:app --port 8000\n")
         sys.exit(1)
 
     print("── meta ────────────────────────────────")
-    test_health(c)
-    test_models(c)
-    test_openapi(c)
+    t.test_health()
+    t.test_models()
+    t.test_openapi()
 
     print("\n── classify ────────────────────────────")
-    test_classify(c)
-    test_classify_batch(c)
+    t.test_classify()
+    t.test_classify_batch()
 
     print("\n── threads ─────────────────────────────")
-    test_thread_not_found(c)
-    thread_id = test_make_thread(c)
+    t.test_thread_not_found()
+    thread_id = t.test_make_thread()
 
     if thread_id:
         print("\n── chat (non-streaming) ────────────────")
-        test_chat_nonstream(c, thread_id)
+        t.test_chat_nonstream(thread_id)
 
         print("\n── chat (streaming) ────────────────────")
-        test_chat_stream(c, thread_id)
+        t.test_chat_stream(thread_id)
 
-    c.close()
-
-    print(f"\n{'─' * 44}")
-    total = passed + failed
-    color = "\033[32m" if failed == 0 else "\033[31m"
-    print(f"{color}{passed}/{total} passed\033[0m\n")
-    sys.exit(0 if failed == 0 else 1)
+    t.close()
+    sys.exit(t.summary())
 
 
 if __name__ == "__main__":
