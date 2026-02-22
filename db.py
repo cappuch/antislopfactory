@@ -70,9 +70,9 @@ class ThreadStore:
         return conn
 
     def _init_tables(self) -> None:
-        self._conn().executescript(_SCHEMA)
-        # migrate: add columns if missing (existing DBs)
         conn = self._conn()
+        conn.executescript(_SCHEMA)
+        # migrate: add columns if missing (existing DBs)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
         if "risk_score" not in cols:
             conn.execute("ALTER TABLE threads ADD COLUMN risk_score REAL NOT NULL DEFAULT 0.0")
@@ -99,12 +99,13 @@ class ThreadStore:
     def _create_thread(self, thread_id: str | None, risk: int = 0) -> str:
         tid = thread_id or genid()
         now = time.time()
-        self._conn().execute(
+        conn = self._conn()
+        conn.execute(
             "INSERT OR IGNORE INTO threads (thread_id, risk, created_at, updated_at) "
             "VALUES (?, ?, ?, ?)",
             (tid, risk, now, now),
         )
-        self._conn().commit()
+        conn.commit()
         return tid
 
     def _get_thread(self, thread_id: str) -> dict | None:
@@ -117,12 +118,13 @@ class ThreadStore:
 
     def _update_risk(self, thread_id: str, risk: int,
                      risk_score: float = 0.0, peak_risk: float = 0.0) -> None:
-        self._conn().execute(
+        conn = self._conn()
+        conn.execute(
             "UPDATE threads SET risk = ?, risk_score = ?, peak_risk = ?, updated_at = ? "
             "WHERE thread_id = ?",
             (risk, risk_score, peak_risk, time.time(), thread_id),
         )
-        self._conn().commit()
+        conn.commit()
 
     async def create_thread(self, thread_id: str | None = None, risk: int = 0) -> str:
         return await asyncio.to_thread(self._create_thread, thread_id, risk)
