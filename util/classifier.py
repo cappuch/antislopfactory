@@ -1,7 +1,6 @@
 import numpy as np
 from pathlib import Path
 
-
 class MLPClassifier:
     def __init__(self, input_dim: int = 512, hidden_dim: int = 128, labels: list[str] | None = None):
         self.input_dim = input_dim
